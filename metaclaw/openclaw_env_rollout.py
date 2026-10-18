@@ -74,6 +74,31 @@ def _strip_thinking(text: str) -> str:
     return _THINK_RE.sub("", text).strip()
 
 
+def _message_tool_calls(message: dict) -> list[dict]:
+    """Accept the proxy's structured calls and legacy raw Qwen wrappers."""
+    raw_calls = message.get("tool_calls")
+    if not raw_calls:
+        parsed = _parse_tool_call(message.get("content") or "")
+        raw_calls = [{"function": parsed}] if parsed else []
+    if not isinstance(raw_calls, list):
+        return []
+    calls = []
+    for call in raw_calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+            continue
+        arguments = function.get("arguments", {})
+        calls.append({
+            "id": call.get("id") or f"call_rollout_{uuid.uuid4().hex}",
+            "type": "function",
+            "function": {
+                "name": function["name"],
+                "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
+            },
+        })
+    return calls
+
+
 # ── Tool schema ───────────────────────────────────────────────────────────────
 
 TOOLS: list[dict] = [
@@ -320,48 +345,63 @@ async def run_task_episode(
                 break
 
             choice = output.get("choices", [{}])[0]
-            content: str = choice.get("message", {}).get("content") or ""
-            tool_call = _parse_tool_call(content)
+            message = choice.get("message") or {}
+            content: str = message.get("content") or ""
+            tool_calls = _message_tool_calls(message)
             brief = _strip_thinking(content)[:120]
 
             logger.info(
                 f"{_YELLOW}[EnvRollout] {task_id} step={step} "
-                f"tool={tool_call!r} response={brief!r}{_RESET}"
+                f"tools={tool_calls!r} response={brief!r}{_RESET}"
             )
 
             # ── No tool call ───────────────────────────────────────────────
-            if tool_call is None:
+            if not tool_calls:
                 logger.info("[EnvRollout] %s: no tool call → closing session", task_id)
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": "No command issued. Closing session."})
                 break
 
-            name = tool_call.get("name")
-            arguments = tool_call["arguments"]
-            command = arguments.get("command")
+            assistant_message = {
+                "role": "assistant", "content": _TOOL_CALL_RE.sub("", content).strip(), "tool_calls": tool_calls,
+            }
+            if message.get("reasoning_content"):
+                assistant_message["reasoning_content"] = message["reasoning_content"]
+            messages.append(assistant_message)
+            task_done = False
+            for tool_call in tool_calls:
+                name = tool_call["function"]["name"]
+                try:
+                    arguments = json.loads(tool_call["function"]["arguments"])
+                except json.JSONDecodeError:
+                    arguments = None
+                command = arguments.get("command") if isinstance(arguments, dict) else None
 
-            # ── Agent signals task complete ────────────────────────────────
-            if name == "run_command" and isinstance(command, str) and command.strip().lower() == "done":
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": "Task complete."})
-                break
-
-            # Dispatch only known tools; disabled or unknown tools never reach the shell.
-            if name == "run_command" and isinstance(command, str) and command.strip():
-                cmd_output = await _exec_command(command.strip())
-            elif name in {"web_search", "web_fetch"}:
-                if not web_enabled:
-                    cmd_output = "Error: web tools are disabled for this rollout."
-                elif not _validate_web_arguments(name, arguments):
-                    cmd_output = "Error: invalid web tool arguments."
+                # Pair every call with a result, including malformed/disabled calls.
+                if task_done:
+                    cmd_output = "Task already complete; tool not executed."
+                elif not isinstance(arguments, dict):
+                    cmd_output = "Error: tool arguments must be a JSON object."
+                elif name == "run_command" and isinstance(command, str) and command.strip().lower() == "done":
+                    cmd_output = "Task complete."
+                    task_done = True
+                elif name == "run_command" and isinstance(command, str) and command.strip():
+                    cmd_output = await _exec_command(command.strip())
+                elif name in {"web_search", "web_fetch"}:
+                    if not web_enabled:
+                        cmd_output = "Error: web tools are disabled for this rollout."
+                    elif not _validate_web_arguments(name, arguments):
+                        cmd_output = "Error: invalid web tool arguments."
+                    else:
+                        cmd_output = await _call_web_tool(name, arguments, web_session_id, model_id)
                 else:
-                    cmd_output = await _call_web_tool(name, arguments, web_session_id, model_id)
-            else:
-                cmd_output = "Error: unknown tool or invalid command arguments."
-            logger.info("[EnvRollout] %s cmd_output: %s", task_id, cmd_output[:200])
-
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": f"Output:\n{cmd_output}"})
+                    cmd_output = "Error: unknown tool or invalid command arguments."
+                logger.info("[EnvRollout] %s tool_output: %s", task_id, cmd_output[:200])
+                messages.append({
+                    "role": "tool", "tool_call_id": tool_call["id"], "name": name, "content": f"Output:\n{cmd_output}",
+                })
+            if task_done:
+                break
 
         # ── Close session (scores last real turn via PRM) ──────────────────
         try:

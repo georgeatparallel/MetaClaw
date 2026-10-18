@@ -4,9 +4,11 @@ The model is scripted; the real MCP SDK serializes requests over MockTransport.
 No live model, search service, OpenClaw CLI, or training backend is required.
 """
 
+import ast
 import asyncio
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -20,13 +22,26 @@ _SPEC.loader.exec_module(rollout)
 _CLIENT = httpx.AsyncClient
 _URL = "https://docs.openclaw.ai/cli?section=agents#add"
 
+# Load the real proxy's pure response normalizer without its optional RL imports.
+_PROXY_AST = ast.parse((Path(__file__).resolve().parents[1] / "metaclaw" / "api_server.py").read_text())
+_PROXY_NAMES = {
+    "_THINK_RE", "_TOOL_HANDLE_RE", "_TRAILING_DIGITS_RE", "_FUNCTIONS_PREFIX_RE",
+    "_KIMI_TOOL_CALL_RE", "_QWEN_TOOL_CALL_RE", "_normalize_tool_name", "_extract_tool_calls_from_text",
+}
+_PROXY_NODES = [node for node in _PROXY_AST.body if (
+    isinstance(node, ast.FunctionDef) and node.name in _PROXY_NAMES
+    or isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in _PROXY_NAMES for t in node.targets)
+)]
+_PROXY_GLOBALS = {"re": re, "json": json}
+exec(compile(ast.Module(body=_PROXY_NODES, type_ignores=[]), "api_server.py", "exec"), _PROXY_GLOBALS)
+
 
 def tool(name, **arguments):
     return "<tool_call>" + json.dumps({"name": name, "arguments": arguments}) + "</tool_call>"
 
 
-@pytest.fixture
-def harness(monkeypatch):
+@pytest.fixture(params=["raw_qwen", "proxy_structured"])
+def harness(monkeypatch, request):
     """Route the actual model and MCP clients through an observable HTTP boundary."""
     model_requests, web_requests = [], []
     replies = []
@@ -37,7 +52,18 @@ def harness(monkeypatch):
         if request.url.host == "proxy.test":
             model_requests.append(payload)
             content = replies.pop(0) if replies else "Session closed."
-            return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+            if isinstance(content, dict):
+                message = content
+            elif request_mode == "proxy_structured":
+                text, calls, reasoning = _PROXY_GLOBALS["_extract_tool_calls_from_text"](content)
+                message = {"role": "assistant", "content": text}
+                if calls:
+                    message["tool_calls"] = calls
+                if reasoning:
+                    message["reasoning_content"] = reasoning
+            else:
+                message = {"role": "assistant", "content": content}
+            return httpx.Response(200, json={"choices": [{"message": message}]})
         web_requests.append(request)
         assert str(request.url) == "https://search.parallel.ai/mcp"
         assert request.headers["User-Agent"] == "MetaClaw (https://github.com/aiming-lab/MetaClaw)"
@@ -71,6 +97,8 @@ def harness(monkeypatch):
                 "isError": behavior["mode"] == "tool_error",
             }
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
+
+    request_mode = request.param
 
     class Client(_CLIENT):
         def __init__(self, *args, **kwargs):
@@ -113,6 +141,11 @@ def test_default_search_fetch_and_cli_results_are_consumed(harness, monkeypatch)
     assert _URL in model[2]["messages"][-1]["content"]
     assert "Gateway ready." in model[3]["messages"][-1]["content"]
     assert commands == ["openclaw status"]
+    for index, message in enumerate(model[-1]["messages"]):
+        if message.get("tool_calls"):
+            response = model[-1]["messages"][index + 1]
+            assert response["role"] == "tool"
+            assert response["tool_call_id"] == message["tool_calls"][0]["id"]
     calls = [json.loads(r.content) for r in web if r.content]
     assert [c["method"] for c in calls].count("tools/list") == 2
     args = [c["params"]["arguments"] for c in calls if c["method"] == "tools/call"]
@@ -181,6 +214,41 @@ def test_web_cancellation_stops_episode(harness):
 
     asyncio.run(cancel_episode())
     assert len(model) == 1
+
+
+def test_structured_multiple_calls_preserve_ids_reasoning_and_results(harness):
+    model, _, replies, _ = harness
+    replies.extend([
+        {"role": "assistant", "content": None, "reasoning_content": "Consult the CLI reference.", "tool_calls": [
+            {"id": "search-1", "type": "function", "function": {
+                "name": "web_search", "arguments": json.dumps({"objective": "docs", "search_queries": ["docs"]}),
+            }},
+            {"id": "fetch-1", "type": "function", "function": {
+                "name": "web_fetch", "arguments": json.dumps({"urls": [_URL]}),
+            }},
+        ]},
+        tool("run_command", command="done"),
+    ])
+    episode()
+    history = model[1]["messages"]
+    assert history[-3]["reasoning_content"] == "Consult the CLI reference."
+    assert [item["tool_call_id"] for item in history[-2:]] == ["search-1", "fetch-1"]
+    assert all(item["role"] == "tool" and _URL in item["content"] for item in history[-2:])
+
+
+@pytest.mark.parametrize("arguments", ["not-json", "[]", "null"])
+def test_invalid_structured_arguments_are_reported_without_execution(harness, arguments):
+    model, web, replies, _ = harness
+    replies.extend([
+        {"content": "", "tool_calls": [{"id": "bad-1", "type": "function", "function": {
+            "name": "web_search", "arguments": arguments,
+        }}]},
+        tool("run_command", command="done"),
+    ])
+    episode()
+    assert "JSON object" in model[1]["messages"][-1]["content"]
+    assert model[1]["messages"][-1]["tool_call_id"] == "bad-1"
+    assert not web
 
 
 def test_rollout_loop_forwards_disable_and_can_be_cancelled(tmp_path, monkeypatch):
