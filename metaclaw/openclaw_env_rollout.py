@@ -173,6 +173,7 @@ async def _call_web_tool(name: str, arguments: dict, session_id: str, model_id: 
     # Imported on demand so disabled rollouts never initialize an MCP client.
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared.exceptions import McpError
 
     async def request() -> str:
         # Never inherit model/proxy credentials or an ambient Parallel API key.
@@ -187,9 +188,12 @@ async def _call_web_tool(name: str, arguments: dict, session_id: str, model_id: 
                     tools = await session.list_tools()
                     if name not in {tool.name for tool in tools.tools}:
                         return f"Error: Parallel MCP does not offer {name}."
-                    result = await session.call_tool(
-                        name, {**arguments, "session_id": session_id, "model_name": model_id[:100]},
-                    )
+                    try:
+                        result = await session.call_tool(
+                            name, {**arguments, "session_id": session_id, "model_name": model_id[:100]},
+                        )
+                    except McpError as exc:
+                        return f"Error: Parallel MCP: {exc.error.message}"
                     text = "\n".join(block.text for block in result.content if block.type == "text")
                     if not text and result.structuredContent:
                         text = json.dumps(result.structuredContent, ensure_ascii=False)

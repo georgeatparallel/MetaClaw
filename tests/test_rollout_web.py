@@ -92,6 +92,11 @@ def harness(monkeypatch, request):
             ]}
         else:
             assert method == "tools/call"
+            if behavior["mode"] == "rpc_error":
+                return httpx.Response(200, json={
+                    "jsonrpc": "2.0", "id": payload["id"],
+                    "error": {"code": -32000, "message": "Free-tier rate limit reached."},
+                })
             result = {
                 "content": [{"type": "text", "text": f"OpenClaw documentation: {_URL}"}],
                 "isError": behavior["mode"] == "tool_error",
@@ -189,6 +194,7 @@ def test_bad_arguments_and_unknown_tools_never_execute(harness, monkeypatch, nam
 
 @pytest.mark.parametrize("mode, expected", [
     ("http_error", "request failed"), ("tool_error", "Error: Parallel MCP:"),
+    ("rpc_error", "Free-tier rate limit reached."),
     ("missing", "does not offer web_search"), ("timeout", "timed out"),
 ])
 def test_web_failures_become_model_observations(harness, monkeypatch, mode, expected):
